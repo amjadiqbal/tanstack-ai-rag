@@ -1,6 +1,6 @@
 {
   "name": "@amjadiqbal/tanstack-ai-rag",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "RAG kit for TanStack AI: token-aware markdown and text chunking, embed-and-store with any TanStack AI embedding adapter, pgvector and in-memory vector stores, a retrieval tool for chat() with citations, and optional rerank().",
   "keywords": [
     "tanstack",

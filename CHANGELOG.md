@@ -5,9 +5,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-## [0.1.1] - 2026-10-23
+## [0.1.2] - 2026-10-23
 
-0.1.0 was tagged but never published to npm; 0.1.1 is the first npm release. The code is the same as 0.1.0.
+The code is the same as 0.1.0. (v0.1.1 was tagged with these changes but not published; its changelog wrongly said 0.1.0 was unpublished.)
 
 ### Documentation
 

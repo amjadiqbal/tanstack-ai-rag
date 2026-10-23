@@ -36,10 +36,10 @@ const stream = chat({
 })
 ```
 
-- **Chunking**: Markdown chunks never cross a heading, keep their heading path (`['Guide', 'Install']`) and keep fenced code blocks whole when they fit; long sections and plain text break at paragraphs, then lines, then sentences, then words. Sizes are in tokens, with overlap; pass your own tokenizer for exact counts.
-- **Ingest**: chunks every document, embeds the chunks in batches with a TanStack AI embedding adapter through `embed()`, and stores them. Ingesting the same document id again replaces its chunks.
+- **Chunking**: Markdown chunks never cross a heading, keep their heading path (`['Guide', 'Install']`) and keep fenced code blocks whole when they fit; long sections and plain text break at paragraphs, then lines, then sentences, then words. Sizes are in tokens; each chunk starts with up to `overlap` tokens from the end of the previous one. Pass your own tokenizer for exact counts.
+- **Ingest**: chunks every document, embeds the chunks in batches with a TanStack AI embedding adapter through `embed()`, and stores them. Ingesting the same document id again replaces its chunks (in one transaction on pgvector).
 - **Retrieve**: embeds the question, runs a cosine search with an optional metadata filter and minimum score, optionally reranks, and numbers the results for citation.
-- **Tool**: `rag.tool()` is a TanStack AI server tool. The model calls it with a search query; it returns `{ query, results: [{ citation, source, url?, headings?, content, score }] }`, which your UI also receives as the tool call's output, so you can show the sources.
+- **Tool**: `rag.tool()` is a TanStack AI server tool. The model calls it with a search query; it returns `{ query, results: [{ citation, id, source, url?, headings?, content, score }] }`, which your UI also receives as the tool call's output, so you can show the sources. Within one `chat()` run, citation numbers continue across searches, so two searches never both produce a `[1]`.
 - No runtime dependencies besides the `@tanstack/ai` peer, and it imports only `embed`, `rerank` and `toolDefinition` from its main entry (no internal subpaths). The Postgres client is yours. No network calls of its own, no telemetry.
 
 ## Install
@@ -110,10 +110,13 @@ const myStore: VectorStore = {
   async upsert(records) {},                            // { id, documentId, content, metadata, vector }[]; replace by id
   async query({ vector, topK, filter }) { return [] }, // best first: { id, documentId, content, metadata, score }
   async deleteDocuments(documentIds) {},
+  // optional: async replaceDocuments(documentIds, records) {} — delete + insert as one atomic step
 }
 ```
 
-`score` is cosine similarity (1 = same direction). `filter` is exact equality on metadata keys, all of which must match.
+`score` is cosine similarity (1 = same direction). Every key in `filter` must match. `filter` is typed for scalar values (string, number, boolean, `null`), and for those both built-in stores behave the same: the value must be equal and of the same type (`1` does not match `'1'`), and `null` matches a key stored as `null` but not a missing key. They differ if you cast an array or object into a filter: `memoryVectorStore` compares with `===`, so arrays and objects never match; `pgvectorStore` uses jsonb containment (`metadata @> filter`), so `{ tags: ['a'] }` matches a chunk tagged `['a', 'b']` and `{ owner: { id: 1 } }` matches an owner object that has more keys. `pgvectorStore` sends the filter as one bound JSON parameter, so keys and values are never spliced into SQL.
+
+If your store implements `replaceDocuments`, `ingest()` uses it; otherwise it calls `deleteDocuments()` then `upsert()`, and a failure between the two loses the document's old chunks.
 
 ## 2. Ingest documents
 
@@ -142,7 +145,12 @@ await rag.ingest([
 await rag.remove('docs/install.md')
 ```
 
-Each chunk is embedded together with its document title and heading path (`Install guide > Install > Configure`), which gives short chunks the context they lack; only the chunk text is stored and returned. The new chunks are embedded before the old ones are deleted, so a failed embedding call leaves the previous version in place.
+Each chunk is embedded together with its document title and heading path (`Install guide > Install > Configure`), which gives short chunks the context they lack; only the chunk text is stored and returned. The new chunks are embedded before the old ones are touched, so a failed embedding call leaves the previous version in place. Then the old chunks are swapped for the new ones:
+
+- **pgvector**: delete and insert run in one transaction (all 500-row insert batches included), so a failed insert rolls back and the old chunks stay. It uses `sql.begin()` on postgres.js, `transaction()` on PGlite, and one checked-out connection on a `pg` Pool. On a single `pg` Client it sends `BEGIN`/`COMMIT` on that client, so don't share the client with other queries during an ingest.
+- **memory**: the new records are copied first (the only step that can fail), then swapped in with no `await` in between, so a query sees either the old chunks or the new ones.
+
+Every `ingest()` embeds every chunk again, even when the content hasn't changed; there's no content hashing. The heading line is part of a Markdown chunk's text (a chunk under `## Configure` starts with `## Configure`).
 
 Models that want different input types for documents and queries (Cohere's `search_document` / `search_query`) get them through `documentModelOptions` and `queryModelOptions`. `dimensions` is passed to every `embed()` call; `batchSize` (default 64) sets how many chunks go into one call.
 
@@ -177,7 +185,11 @@ export const Route = createFileRoute('/api/chat')({
 })
 ```
 
-`rag.tool()` options: `name` (default `search_knowledge_base`), `description` (say what the knowledge base holds; the model uses it to decide when to search), `topK`, `minScore`, and a fixed `filter` applied to every search (a tenant or product id, for example). `citationInstructions` is a short system prompt that asks the model to cite results as `[n]` and to say so when the results don't contain the answer.
+`rag.tool()` options: `name` (default `search_knowledge_base`), `description` (say what the knowledge base holds; the model uses it to decide when to search), `topK`, `minScore`, a fixed `filter` applied to every search (a tenant or product id, for example), and `citations`. `citationInstructions` is a short system prompt that asks the model to cite results as `[n]` and to say so when the results don't contain the answer.
+
+### Citation numbers
+
+With `citations: 'run'` (the default), numbering is per `chat()` run: the first search's results are `[1]`, `[2]`, …; a later search in the same run gives new chunks the next numbers (`[3]`, `[4]`) and a chunk that was already returned keeps its number. Results stay in relevance order, so a later search can list `[4]` before `[2]`. The numbers are tracked per run through the run's abort signal, so they need nothing from you and are dropped with the run. Each new run (the next user message) starts at `[1]` again. With `citations: 'call'`, or when the tool runs outside `chat()`, every call starts at `[1]`. Every result also carries `id`, the chunk id, which is stable across calls and runs.
 
 ### Show the sources in React
 
@@ -222,7 +234,7 @@ const stream = chat({
 })
 ```
 
-`formatContext()` renders the results as numbered blocks (`[1] Install guide (Install > Configure)` followed by the chunk), matching the citation numbers on `results`.
+`formatContext()` renders the results as numbered blocks (`[1] Install guide (Install > Configure)` followed by the chunk), matching the citation numbers on `results`. `retrieve()` numbers each call from `[1]`; the run-wide numbering above is the tool's.
 
 `retrieve()` returns `RagResult[]`: everything the store returned (`id`, `documentId`, `content`, `metadata`, `score`) plus `citation`, `source`, `url`, `headings` and, with a reranker, `rerankScore`.
 
@@ -241,7 +253,7 @@ const rag = createRag({
 })
 ```
 
-The results come back in the reranker's order, each with `rerankScore`; the tool reports `rerankScore` as `score` when a reranker is set. `minScore` still applies to the vector score, before reranking. Inside `chat()`, the tool call's abort signal is passed to the rerank request.
+The results come back in the reranker's order, each with `rerankScore`; the tool reports `rerankScore` as `score` when a reranker is set. `minScore` still applies to the vector score, before reranking. The reranker gets only the chunk text (no title or heading path). Inside `chat()`, the run's abort signal is passed to the rerank request; it is the only request that gets it, because TanStack AI's `embed()` and the store calls take no signal.
 
 ## Errors and edge cases
 
@@ -254,6 +266,7 @@ The results come back in the reranker's order, each with `rerankScore`; the tool
 | A document whose content is empty or only whitespace | No chunks; its previous chunks are deleted (`chunks: 0`) |
 | The embedding adapter returns a different number of vectors than inputs | `Error: embedding adapter returned <n> vectors for <m> inputs`, old chunks kept |
 | Any error from the embedding adapter during `ingest()` | Rethrown, old chunks kept |
+| An insert fails while `ingest()` replaces a document on pgvector (any batch) | The transaction rolls back, the error is rethrown, the old chunks stay |
 | `batchSize` below 1 | Treated as 1 |
 | `metadata` with keys `title`, `url`, `headings` or `chunkIndex` | Overwritten by the document's `title`/`url` and the chunk's own values |
 | `topK: 0` | `[]` |
@@ -282,7 +295,7 @@ const chunks = chunkMarkdown(markdown, { maxTokens: 400, overlap: 40, countToken
 // [{ content, index, tokens, start, end, headings: ['Guide', 'Install'] }, ...]
 ```
 
-`start` and `end` are character offsets into the source, so `source.slice(start, end) === content`. The default token counter, `estimateTokens`, assumes about 4 characters per token; pass a real tokenizer when chunks must fit a hard model limit. A heading followed directly by a sub-heading gives no chunk of its own; its title stays in the sub-section's heading path.
+`start` and `end` are character offsets into the source, so `source.slice(start, end) === content`. The default token counter, `estimateTokens`, assumes about 4 characters per token; pass a real tokenizer when chunks must fit a hard model limit. A heading with no text of its own (followed directly by a sub-heading, or the last line of the document) gives no chunk; when a sub-section follows, its title stays in that sub-section's heading path. The overlap is the longest end of the previous chunk that fits in `overlap` tokens, starting at a word boundary (at any character when the text has no spaces); it is smaller, or zero, when the next piece of text already takes up most of `maxTokens`. Chunks never overlap across a Markdown heading.
 
 ## API
 
@@ -302,9 +315,9 @@ const chunks = chunkMarkdown(markdown, { maxTokens: 400, overlap: 40, countToken
 
 No live provider API was called and no API key was used. Provider traffic went to local mocks: [aimock](https://github.com/CopilotKit/aimock) for OpenAI chat and Cohere rerank, and a small local server for OpenAI's `/v1/embeddings` that returns bag-of-words vectors per input, so similarity is meaningful.
 
-- **Unit tests** (vitest): chunk sizes with the estimator and with `js-tiktoken`, overlap, offsets, coverage, paragraph-first breaking, hard splits, Markdown heading paths, fenced code (backticks and tildes, `#` lines inside fences), CRLF; `createRag` ingest, re-ingest, failed-embedding rollback, remove, filters, `minScore`, batching, model options, `formatContext`, rerank order, scores and abort signal, the tool's output, name, description, filter and empty query, and every row of [Errors and edge cases](#errors-and-edge-cases).
-- **Store conformance** (the same checks for each): `memoryVectorStore`, and `pgvectorStore` on PGlite and on Postgres 17 + pgvector in Docker (`pgvector/pgvector:pg17`) through `pg`, postgres.js and Drizzle (`drizzle-orm/node-postgres`): nearest-first order, scores, metadata filters, nested JSON metadata, upsert-replace, delete by document, 1,200-row batches, idempotent `migrate()` and the HNSW index.
-- **Integration** with real TanStack AI adapters over HTTP: `@tanstack/ai-openai` embeddings into PGlite and Docker Postgres; `chat()` with `openaiText` (Responses API) and `openaiChatCompletions` calling `rag.tool()` and answering with a citation; retrieved context passed through `systemPrompts`; `@tanstack/ai-cohere` rerank reordering results.
+- **Unit tests** (vitest): chunk sizes with the estimator and with `js-tiktoken`, overlap, offsets, coverage, paragraph-first breaking, hard splits, Markdown heading paths, fenced code (backticks and tildes, `#` lines inside fences), overlap on long paragraphs (every neighbouring pair overlaps by at most `overlap` tokens, with the estimator and `js-tiktoken`), CRLF; `createRag` ingest, re-ingest, failed-embedding rollback, remove, filters, `minScore`, batching, model options, `formatContext`, rerank order, scores and abort signal, the tool's output, name, description, filter and empty query, citation numbering across calls in one run, and every row of [Errors and edge cases](#errors-and-edge-cases).
+- **Store conformance** (the same checks for each): `memoryVectorStore`, and `pgvectorStore` on PGlite and on Postgres 17 + pgvector in Docker (`pgvector/pgvector:pg17`) through `pg`, postgres.js and Drizzle (`drizzle-orm/node-postgres`): nearest-first order, scores, metadata filters, nested JSON metadata, upsert-replace, delete by document, 1,200-row batches, `null` filters, number vs string filters, `replaceDocuments` (including a failure in the second 500-row batch that leaves the old chunks in place), idempotent `migrate()` and the HNSW index. Separately: array and object filters on both stores (`===` vs jsonb containment), a filter with SQL in its key and value returning nothing on PGlite, and a failed re-ingest through `createRag` on pgvector keeping the old chunks.
+- **Integration** with real TanStack AI adapters over HTTP: `@tanstack/ai-openai` embeddings into PGlite and Docker Postgres; `chat()` with `openaiText` (Responses API) and `openaiChatCompletions` calling `rag.tool()` and answering with a citation; retrieved context passed through `systemPrompts`; `@tanstack/ai-cohere` rerank reordering results; two searches in one `chat()` run numbered `[1]`, `[2]`, then `[3]`.
 - **In a real browser**: a TanStack Start 1.169 app with `@tanstack/ai-react` `useChat`, the server route above, Postgres + pgvector in Docker, and the packed npm tarball installed. Seen working: ingesting Markdown documents, search with heading paths and scores, the product filter, the `formatContext` block, a chat question that triggers the tool and shows numbered sources (with a link from `url`) and an answer citing `[1]`, follow-up turns on the same thread, a newly added document found by the next question, a removed document no longer returned, and rerank reordering the sources.
 - **Not tested**: live embedding and chat APIs (so retrieval quality with real embeddings is not measured here), embedding adapters other than OpenAI's, hosted Postgres services, Drizzle on its postgres.js or PGlite drivers, and Vue, Solid or Svelte clients.
 
@@ -312,9 +325,9 @@ No live provider API was called and no API key was used. Provider traffic went t
 
 - **No Pinecone, Upstash Vector or Qdrant adapters yet**: they could not be tested locally. Write a `VectorStore` (three methods, above), or open an issue.
 - **Markdown**: ATX headings (`#`) only; setext headings (text underlined with `===` or `---`) and headings inside HTML blocks are treated as text.
-- **Re-ingest is not one transaction**: old chunks are deleted, then the new ones inserted, so a query running at that moment can miss the document.
-- TanStack AI's `embed()` has no abort signal, so the embedding step of a search cannot be cancelled.
-- Filters are exact matches on scalar metadata values. For ranges or `IN`, filter in your own store or query.
+- **Re-ingest is atomic only in stores with `replaceDocuments`** (both built-in stores have it). Unchanged content is still embedded again.
+- TanStack AI's `embed()` has no abort signal, so the embedding step of a search, and the store query, cannot be cancelled; only rerank can.
+- Filters are equality on scalar metadata values (see above for arrays and objects). For ranges or `IN`, filter in your own store or query.
 - The default token count is an estimate (about 4 characters per token).
 
 ## Support

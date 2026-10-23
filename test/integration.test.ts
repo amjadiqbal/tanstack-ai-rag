@@ -52,6 +52,24 @@ beforeAll(async () => {
     match: { userMessage: /pricing question/, systemMessage: ['[1] Pricing (Pricing)', '49 dollars'] },
     response: { content: 'The team plan is 49 dollars a month [1].' },
   });
+  // Two searches in one answer: first refunds, then pricing, then the answer.
+  const toolMessages = (req: { messages: { role: string }[] }) => req.messages.filter((m) => m.role === 'tool').length;
+  mock.addFixture({
+    match: { userMessage: /two searches/, predicate: (req) => toolMessages(req) === 0 },
+    response: {
+      toolCalls: [{ name: 'search_knowledge_base', arguments: JSON.stringify({ query: 'refund policy days' }) }],
+    },
+  });
+  mock.addFixture({
+    match: { userMessage: /two searches/, predicate: (req) => toolMessages(req) === 1 },
+    response: {
+      toolCalls: [{ name: 'search_knowledge_base', arguments: JSON.stringify({ query: 'team plan price' }) }],
+    },
+  });
+  mock.addFixture({
+    match: { userMessage: /two searches/, predicate: (req) => toolMessages(req) === 2 },
+    response: { content: 'Done.' },
+  });
   mock.onRerank(/refund/, [
     { index: 2, relevance_score: 0.97 },
     { index: 0, relevance_score: 0.41 },
@@ -166,6 +184,38 @@ describe('retrieve first, then chat with the context in the system prompt', () =
       .map((c) => (c as { delta: string }).delta)
       .join('');
     expect(text).toBe('The team plan is 49 dollars a month [1].');
+    await db.close();
+  });
+});
+
+describe('two tool calls in one chat() run', () => {
+  it('numbers the second search after the first, reusing numbers for repeated chunks', async () => {
+    const db = new PGlite({ extensions: { vector } });
+    const store = pgvectorStore({ db, dimensions: 256 });
+    await store.migrate();
+    const rag = createRag({ embedding: embeddingAdapter(), store, topK: 2 });
+    await rag.ingest(docs);
+    const chunks = await collect(
+      chat({
+        threadId: 't4',
+        adapter: createOpenaiChat('gpt-4o-mini', key, { baseURL: `${mockUrl}/v1` }),
+        messages: [{ role: 'user', content: 'Answer with two searches please' }],
+        tools: [rag.tool()],
+      }),
+    );
+    expect(chunks.find((c) => c.type === 'RUN_ERROR')).toBeUndefined();
+    const outputs = chunks
+      .filter((c) => c.type === 'TOOL_CALL_RESULT')
+      .map((c) => JSON.parse((c as { content: string }).content) as RagToolOutput);
+    expect(outputs).toHaveLength(2);
+    const [first, second] = outputs as [RagToolOutput, RagToolOutput];
+    expect(first.results.map((r) => r.citation)).toEqual([1, 2]);
+    const firstIds = new Map(first.results.map((r) => [r.id, r.citation]));
+    for (const r of second.results) {
+      if (firstIds.has(r.id)) expect(r.citation).toBe(firstIds.get(r.id));
+      else expect(r.citation).toBeGreaterThan(2);
+    }
+    expect(second.results.find((r) => r.source === 'Pricing')?.citation).toBe(3);
     await db.close();
   });
 });

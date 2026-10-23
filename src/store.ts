@@ -36,6 +36,12 @@ export interface VectorStore {
   query(query: VectorQuery): Promise<VectorMatch[]>;
   /** Deletes every chunk of the given documents. */
   deleteDocuments(documentIds: string[]): Promise<void>;
+  /**
+   * Optional: deletes every chunk of the given documents and stores `records` as one atomic step, so a failure keeps
+   * the old chunks and a query never sees the document half replaced. Without it, `ingest()` calls
+   * `deleteDocuments()` then `upsert()`.
+   */
+  replaceDocuments?(documentIds: string[], records: VectorRecord[]): Promise<void>;
 }
 
 export function cosineSimilarity(a: readonly number[], b: readonly number[]): number {
@@ -92,6 +98,13 @@ export function memoryVectorStore(): MemoryVectorStore {
     async deleteDocuments(documentIds) {
       const ids = new Set(documentIds);
       for (const [id, r] of records) if (ids.has(r.documentId)) records.delete(id);
+    },
+    async replaceDocuments(documentIds, items) {
+      // Copy first (this is the only step that can throw), then swap with no await in between.
+      const copies = items.map((r) => ({ ...r, vector: [...r.vector], metadata: structuredClone(r.metadata) }));
+      const ids = new Set(documentIds);
+      for (const [id, r] of records) if (ids.has(r.documentId)) records.delete(id);
+      for (const r of copies) records.set(r.id, r);
     },
   };
 }

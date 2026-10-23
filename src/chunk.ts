@@ -4,7 +4,10 @@ export type CountTokens = (text: string) => number;
 export interface ChunkOptions {
   /** Largest chunk, in tokens as measured by `countTokens`. Default 512. */
   maxTokens?: number;
-  /** Tokens repeated from the end of one chunk at the start of the next. Default 64. Must be below `maxTokens`. */
+  /**
+   * Most tokens repeated from the end of one chunk at the start of the next (starting at a word boundary; less when
+   * the next piece of text leaves no room). Default `min(64, floor(maxTokens / 4))`. Must be below `maxTokens`.
+   */
   overlap?: number;
   /**
    * Token counter. The default, {@link estimateTokens}, is a fast approximation (about 4 characters per token).
@@ -105,12 +108,12 @@ function trimSpan(text: string, span: Span): Span | null {
   return start < end ? { start, end } : null;
 }
 
-/** Greedily packs atoms into chunks of at most `maxTokens`, carrying up to `overlap` tokens of trailing atoms forward. */
+/** Greedily packs atoms into chunks of at most `maxTokens`; each new chunk starts with up to `overlap` tokens of the last one. */
 function pack(text: string, atoms: Span[], r: Resolved, headings?: string[]): Omit<Chunk, 'index'>[] {
   const chunks: Omit<Chunk, 'index'>[] = [];
   const sizeOf = (a: Span[]) => r.count(text.slice((a[0] as Span).start, (a[a.length - 1] as Span).end));
   let current: Span[] = [];
-  let fresh = 0; // atoms in `current` that are not overlap from the previous chunk
+  let fresh = 0; // spans in `current` that are not overlap from the previous chunk
 
   const emit = () => {
     const first = current[0];
@@ -135,13 +138,8 @@ function pack(text: string, atoms: Span[], r: Resolved, headings?: string[]): Om
       continue;
     }
     emit();
-    const carried: Span[] = [];
-    for (let i = current.length - 1; i >= 0 && r.overlap > 0; i--) {
-      const next = [current[i] as Span, ...carried];
-      if (sizeOf(next) > r.overlap || sizeOf([...next, atom]) > r.maxTokens) break;
-      carried.unshift(current[i] as Span);
-    }
-    current = [...carried, atom];
+    const tail = overlapTail(text, current, atom, r);
+    current = tail ? [tail, atom] : [atom];
     fresh = 1;
   }
   emit();
@@ -149,8 +147,42 @@ function pack(text: string, atoms: Span[], r: Resolved, headings?: string[]): Om
 }
 
 /**
+ * The longest end of the chunk just emitted that fits in `overlap` tokens and still leaves room for `next`.
+ * It starts at a word boundary when one fits, else at any character (text without spaces).
+ */
+function overlapTail(text: string, current: Span[], next: Span, r: Resolved): Span | null {
+  if (r.overlap === 0) return null;
+  const prev = trimSpan(text, { start: (current[0] as Span).start, end: (current[current.length - 1] as Span).end });
+  if (!prev) return null;
+  const fits = (p: number) =>
+    r.count(text.slice(p, prev.end)) <= r.overlap && r.count(text.slice(p, next.end)) <= r.maxTokens;
+  // `fits` only gets truer as p moves right, so binary-search the leftmost start that fits.
+  const leftmost = (starts: number[]) => {
+    let lo = 0;
+    let hi = starts.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (fits(starts[mid] as number)) hi = mid;
+      else lo = mid + 1;
+    }
+    return starts[lo];
+  };
+  const words: number[] = [];
+  for (let i = prev.start; i < prev.end; i++) {
+    if (!/\s/.test(text[i] as string) && (i === prev.start || /\s/.test(text[i - 1] as string))) words.push(i);
+  }
+  let start = leftmost(words);
+  if (start === undefined) {
+    const chars = Array.from({ length: prev.end - prev.start }, (_, i) => prev.start + i);
+    start = leftmost(chars);
+  }
+  return start === undefined ? null : { start, end: prev.end };
+}
+
+/**
  * Splits plain text into chunks of at most `maxTokens`, breaking at paragraphs, then lines, then sentences,
- * then words, and repeating about `overlap` tokens between neighbouring chunks.
+ * then words. Each chunk after the first starts with the longest end of the previous chunk that fits in `overlap`
+ * tokens (from a word boundary) while keeping the chunk within `maxTokens`.
  */
 export function chunkText(text: string, options?: ChunkOptions): Chunk[] {
   const r = resolve(options);

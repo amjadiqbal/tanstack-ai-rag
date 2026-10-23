@@ -252,3 +252,47 @@ describe('rerank', () => {
 });
 
 const setupStore = (rag: ReturnType<typeof createRag>) => rag.store;
+
+describe('citation numbering in rag.tool()', () => {
+  const call = async (tool: ReturnType<ReturnType<typeof createRag>['tool']>, query: string, signal?: AbortSignal) =>
+    (await tool.execute?.({ query }, (signal ? { abortSignal: signal } : {}) as never)) as RagToolOutput;
+
+  it('continues numbers across calls in one run and keeps a chunk number stable', async () => {
+    const { rag } = setup({ topK: 2 });
+    await rag.ingest(docs);
+    const tool = rag.tool();
+    const run = new AbortController().signal;
+    const first = await call(tool, 'refund within 30 days', run);
+    const second = await call(tool, 'team plan cost per month', run);
+    const again = await call(tool, 'refund within 30 days', run);
+    expect(first.results.map((r) => r.citation)).toEqual([1, 2]);
+    const byId = new Map([...first.results, ...second.results].map((r) => [r.id, r.citation]));
+    expect(new Set(byId.values()).size).toBe(byId.size); // no number used twice
+    for (const r of second.results) {
+      const seen = first.results.find((f) => f.id === r.id);
+      expect(r.citation).toEqual(seen ? seen.citation : expect.any(Number));
+    }
+    expect(second.results.some((r) => r.citation > 2)).toBe(true);
+    expect(again.results.map((r) => r.citation)).toEqual(first.results.map((r) => r.citation));
+  });
+
+  it('starts again at 1 in a new run, with citations: "call", and without a signal', async () => {
+    const { rag } = setup({ topK: 2 });
+    await rag.ingest(docs);
+    const tool = rag.tool();
+    await call(tool, 'refund within 30 days', new AbortController().signal);
+    const other = await call(tool, 'team plan cost per month', new AbortController().signal);
+    expect(other.results.map((r) => r.citation)).toEqual([1, 2]);
+    const perCall = rag.tool({ citations: 'call' });
+    const run = new AbortController().signal;
+    await call(perCall, 'refund within 30 days', run);
+    expect((await call(perCall, 'team plan cost per month', run)).results.map((r) => r.citation)).toEqual([1, 2]);
+    expect((await call(tool, 'team plan cost per month')).results.map((r) => r.citation)).toEqual([1, 2]);
+  });
+
+  it('returns the chunk id with each result', async () => {
+    const { rag } = setup({ topK: 1 });
+    await rag.ingest(docs);
+    expect((await call(rag.tool(), 'refund within 30 days')).results[0]?.id).toBe('docs/refunds.md#0');
+  });
+});

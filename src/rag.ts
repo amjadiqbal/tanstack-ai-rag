@@ -78,6 +78,8 @@ export interface RagToolOutput {
   query: string;
   results: Array<{
     citation: number;
+    /** The chunk id (`<documentId>#<chunkIndex>`), stable across calls. */
+    id: string;
     source: string;
     url?: string;
     headings?: string[];
@@ -95,6 +97,12 @@ export interface RagToolOptions {
   minScore?: number;
   /** Fixed filter applied to every search the model makes (e.g. a tenant or product id). */
   filter?: MetadataFilter;
+  /**
+   * How results are numbered. `run` (default): within one `chat()` run, a chunk keeps its number across tool calls
+   * and new chunks continue the count, so two searches in one answer never both have a `[1]`. `call`: every call
+   * starts at 1. Outside `chat()` (no abort signal in the tool context) every call starts at 1.
+   */
+  citations?: 'run' | 'call';
 }
 
 export interface IngestResult {
@@ -179,8 +187,12 @@ export function createRag(options: RagOptions) {
       },
     }));
     // Embed first, then replace: a failed embedding call leaves the old chunks in place.
-    await store.deleteDocuments(docs.map((d) => d.id));
-    await store.upsert(records);
+    const ids = docs.map((d) => d.id);
+    if (store.replaceDocuments) await store.replaceDocuments(ids, records);
+    else {
+      await store.deleteDocuments(ids);
+      await store.upsert(records);
+    }
     return { documents: docs.length, chunks: records.length };
   }
 
@@ -233,6 +245,9 @@ export function createRag(options: RagOptions) {
       .join('\n\n');
   }
 
+  // Citation numbers per chat run, keyed by the run's abort signal (one per run), so they are freed with the run.
+  const runCitations = new WeakMap<AbortSignal, Map<string, number>>();
+
   /** A server tool for `chat({ tools })`: the model searches the knowledge base and cites results as `[n]`. */
   function tool(toolOptions: RagToolOptions = {}) {
     return toolDefinition({
@@ -250,10 +265,24 @@ export function createRag(options: RagOptions) {
         ...(toolOptions.filter ? { filter: toolOptions.filter } : {}),
         ...(context?.abortSignal ? { abortSignal: context.abortSignal } : {}),
       });
+      const signal = context?.abortSignal;
+      let numbers: Map<string, number> | undefined;
+      if (signal && (toolOptions.citations ?? 'run') === 'run') {
+        numbers = runCitations.get(signal);
+        if (!numbers) runCitations.set(signal, (numbers = new Map()));
+      }
+      const numberOf = (r: RagResult) => {
+        if (!numbers) return r.citation;
+        const known = numbers.get(r.id);
+        if (known !== undefined) return known;
+        numbers.set(r.id, numbers.size + 1);
+        return numbers.size;
+      };
       return {
         query,
         results: results.map((r) => ({
-          citation: r.citation,
+          citation: numberOf(r),
+          id: r.id,
           source: r.source,
           ...(r.url ? { url: r.url } : {}),
           ...(r.headings ? { headings: r.headings } : {}),

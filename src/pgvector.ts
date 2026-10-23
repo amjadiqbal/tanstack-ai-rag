@@ -1,4 +1,4 @@
-import type { VectorMatch, VectorStore } from './store';
+import type { VectorMatch, VectorRecord, VectorStore } from './store';
 
 /** `pg` Pool or Client, PGlite, and anything else with `query(text, params)` that resolves to `{ rows }`. */
 export interface QueryClient {
@@ -32,6 +32,8 @@ export interface PgvectorStoreOptions {
 }
 
 export interface PgvectorStore extends VectorStore {
+  /** Deletes the documents' chunks and inserts `records` in one transaction (used by `ingest()`). */
+  replaceDocuments(documentIds: string[], records: VectorRecord[]): Promise<void>;
   /** Creates the `vector` extension, the table and its indexes if they don't exist. Safe to run on every start. */
   migrate(): Promise<void>;
   /** The quoted table name used in SQL. */
@@ -39,16 +41,85 @@ export interface PgvectorStore extends VectorStore {
 }
 
 type Exec = (text: string, params?: unknown[]) => Promise<Record<string, unknown>[]>;
+/** Runs `fn` inside BEGIN ... COMMIT on one connection, rolling back if it throws. */
+type Transact = (fn: (exec: Exec) => Promise<void>) => Promise<void>;
+
+// Driver shapes used only for transactions; kept loose because each driver types them differently.
+type AnyClient = {
+  query?: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
+  unsafe?: (text: string, params?: never[]) => PromiseLike<unknown>;
+  begin?: (fn: (tx: AnyClient) => Promise<unknown>) => PromiseLike<unknown>;
+  transaction?: (fn: (tx: AnyClient) => Promise<unknown>) => Promise<unknown>;
+  connect?: () => Promise<AnyClient & { release(): void }>;
+  idleCount?: number;
+};
+
+function clientOf(db: PgDatabase): AnyClient {
+  return ('$client' in db && db.$client ? db.$client : db) as AnyClient;
+}
+
+function execOf(client: AnyClient): Exec | null {
+  const { unsafe, query } = client;
+  if (typeof unsafe === 'function') {
+    return async (text, params) => Array.from((await unsafe.call(client, text, params as never[])) as Iterable<never>);
+  }
+  if (typeof query === 'function') {
+    return async (text, params) => (await query.call(client, text, params)).rows as Record<string, unknown>[];
+  }
+  return null;
+}
 
 function toExec(db: PgDatabase): Exec {
-  const client = '$client' in db && db.$client ? db.$client : db;
-  if ('unsafe' in client && typeof client.unsafe === 'function') {
-    return async (text, params) => Array.from((await client.unsafe(text, params as never[])) as Iterable<never>);
+  const exec = execOf(clientOf(db));
+  if (!exec) {
+    throw new TypeError('pgvectorStore: db must be a pg Pool/Client, postgres.js sql, PGlite or a Drizzle database');
   }
-  if ('query' in client && typeof client.query === 'function') {
-    return async (text, params) => (await client.query(text, params)).rows as Record<string, unknown>[];
+  return exec;
+}
+
+function toTransact(db: PgDatabase): Transact {
+  const client = clientOf(db);
+  // postgres.js: sql.begin() pins one connection.
+  if (typeof client.begin === 'function') {
+    return async (fn) => {
+      await (client.begin as NonNullable<AnyClient['begin']>)((tx) => fn(execOf(tx) as Exec));
+    };
   }
-  throw new TypeError('pgvectorStore: db must be a pg Pool/Client, postgres.js sql, PGlite or a Drizzle database');
+  // PGlite: db.transaction().
+  if (typeof client.transaction === 'function') {
+    return async (fn) => {
+      await (client.transaction as NonNullable<AnyClient['transaction']>)((tx) => fn(execOf(tx) as Exec));
+    };
+  }
+  // pg Pool: check out one client for the whole transaction.
+  if (typeof client.connect === 'function' && typeof client.idleCount === 'number') {
+    return async (fn) => {
+      const conn = await (client.connect as NonNullable<AnyClient['connect']>)();
+      const exec = execOf(conn) as Exec;
+      try {
+        await exec('BEGIN');
+        await fn(exec);
+        await exec('COMMIT');
+      } catch (error) {
+        await exec('ROLLBACK').catch(() => {});
+        throw error;
+      } finally {
+        conn.release();
+      }
+    };
+  }
+  // A single connection (pg Client): BEGIN/COMMIT on it directly.
+  const exec = toExec(db);
+  return async (fn) => {
+    await exec('BEGIN');
+    try {
+      await fn(exec);
+      await exec('COMMIT');
+    } catch (error) {
+      await exec('ROLLBACK').catch(() => {});
+      throw error;
+    }
+  };
 }
 
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
@@ -75,8 +146,32 @@ const BATCH = 500;
  */
 export function pgvectorStore(options: PgvectorStoreOptions): PgvectorStore {
   const exec = toExec(options.db);
+  const transact = toTransact(options.db);
   const table = quoteTable(options.table ?? 'rag_chunks');
   const bare = (options.table ?? 'rag_chunks').replace('.', '_');
+
+  async function upsertWith(run: Exec, records: VectorRecord[]) {
+    for (let i = 0; i < records.length; i += BATCH) {
+      const batch = records.slice(i, i + BATCH);
+      const params: unknown[] = [];
+      const rows = batch.map((r, j) => {
+        params.push(r.id, r.documentId, r.content, JSON.stringify(r.metadata ?? {}), toVector(r.vector));
+        const b = j * 5;
+        return `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}::text::jsonb, $${b + 5}::vector)`;
+      });
+      await run(
+        `INSERT INTO ${table} (id, document_id, content, metadata, embedding) VALUES ${rows.join(', ')}
+         ON CONFLICT (id) DO UPDATE SET document_id = EXCLUDED.document_id, content = EXCLUDED.content,
+           metadata = EXCLUDED.metadata, embedding = EXCLUDED.embedding`,
+        params,
+      );
+    }
+  }
+
+  async function deleteWith(run: Exec, documentIds: string[]) {
+    if (!documentIds.length) return;
+    await run(`DELETE FROM ${table} WHERE document_id = ANY($1::text[])`, [documentIds]);
+  }
 
   return {
     table,
@@ -103,23 +198,7 @@ export function pgvectorStore(options: PgvectorStoreOptions): PgvectorStore {
         );
       }
     },
-    async upsert(records) {
-      for (let i = 0; i < records.length; i += BATCH) {
-        const batch = records.slice(i, i + BATCH);
-        const params: unknown[] = [];
-        const rows = batch.map((r, j) => {
-          params.push(r.id, r.documentId, r.content, JSON.stringify(r.metadata ?? {}), toVector(r.vector));
-          const b = j * 5;
-          return `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}::text::jsonb, $${b + 5}::vector)`;
-        });
-        await exec(
-          `INSERT INTO ${table} (id, document_id, content, metadata, embedding) VALUES ${rows.join(', ')}
-           ON CONFLICT (id) DO UPDATE SET document_id = EXCLUDED.document_id, content = EXCLUDED.content,
-             metadata = EXCLUDED.metadata, embedding = EXCLUDED.embedding`,
-          params,
-        );
-      }
-    },
+    upsert: (records) => upsertWith(exec, records),
     async query({ vector, topK, filter }) {
       const params: unknown[] = [toVector(vector), Math.max(0, Math.floor(topK))];
       let where = '';
@@ -142,9 +221,11 @@ export function pgvectorStore(options: PgvectorStoreOptions): PgvectorStore {
         }),
       );
     },
-    async deleteDocuments(documentIds) {
-      if (!documentIds.length) return;
-      await exec(`DELETE FROM ${table} WHERE document_id = ANY($1::text[])`, [documentIds]);
-    },
+    deleteDocuments: (documentIds) => deleteWith(exec, documentIds),
+    replaceDocuments: (documentIds, records) =>
+      transact(async (tx) => {
+        await deleteWith(tx, documentIds);
+        await upsertWith(tx, records);
+      }),
   };
 }

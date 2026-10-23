@@ -1,7 +1,7 @@
 import { PGlite } from '@electric-sql/pglite';
 import { vector } from '@electric-sql/pglite-pgvector';
 import { describe, expect, it } from 'vitest';
-import { chunkText, cosineSimilarity, createRag, memoryVectorStore, pgvectorStore } from '../src';
+import { chunkMarkdown, chunkText, cosineSimilarity, createRag, memoryVectorStore, pgvectorStore } from '../src';
 import { BagOfWordsEmbedding, DOCS } from './helpers';
 
 describe('documented edge cases', () => {
@@ -82,5 +82,79 @@ describe('documented edge cases', () => {
     const out = (await rag.tool().execute?.({ query: 'refund days' })) as { results: { score: number }[] };
     const score = out.results[0]?.score ?? 0;
     expect(Math.round(score * 1000) / 1000).toBe(score);
+  });
+});
+
+describe('atomic re-ingest', () => {
+  it('pgvector: a failure while storing the new chunks keeps the old ones', async () => {
+    const db = new PGlite({ extensions: { vector } });
+    const store = pgvectorStore({ db, dimensions: 256 });
+    await store.migrate();
+    const embedding = new BagOfWordsEmbedding();
+    const rag = createRag({ embedding, store, chunking: { maxTokens: 20, overlap: 0 } });
+    await rag.ingest({ id: 'doc', content: DOCS.pricing });
+    const before = await store.query({ vector: new Array(256).fill(1), topK: 100 });
+    // Every chunk after the first gets a vector of the wrong size, so the INSERT fails inside the transaction.
+    const original = embedding.createEmbeddings.bind(embedding);
+    embedding.createEmbeddings = async (o) => {
+      const r = await original(o);
+      return { ...r, embeddings: r.embeddings.map((e, i) => (i === 0 ? e : { ...e, vector: [1, 2] })) };
+    };
+    const long = Array.from({ length: 40 }, (_, i) => `Sentence ${i} about plans.`).join(' ');
+    await expect(rag.ingest({ id: 'doc', content: long })).rejects.toThrow(/dimensions/);
+    expect(await store.query({ vector: new Array(256).fill(1), topK: 100 })).toEqual(before);
+    await db.close();
+  });
+
+  it('memory: replace swaps in one synchronous step', async () => {
+    const store = memoryVectorStore();
+    const rag = createRag({ embedding: new BagOfWordsEmbedding(), store });
+    await rag.ingest({ id: 'doc', content: DOCS.pricing });
+    const pending = rag.ingest({ id: 'doc', content: DOCS.refunds });
+    expect(store.size).toBe(1);
+    await pending;
+    const [hit] = await store.query({ vector: new Array(256).fill(1), topK: 5 });
+    expect(hit?.content).toContain('Refunds');
+  });
+});
+
+describe('more documented behaviour', () => {
+  it('a heading-only last section gives no chunk', () => {
+    const chunks = chunkMarkdown('# A\n\ntext\n\n## Trailing heading\n', { maxTokens: 100, overlap: 0 });
+    expect(chunks.map((c) => c.content)).toEqual(['# A\n\ntext']);
+  });
+
+  it('re-ingesting unchanged content embeds it again', async () => {
+    const embedding = new BagOfWordsEmbedding();
+    const rag = createRag({ embedding, store: memoryVectorStore() });
+    await rag.ingest({ id: 'a', content: DOCS.pricing });
+    await rag.ingest({ id: 'a', content: DOCS.pricing });
+    expect(embedding.calls).toHaveLength(2);
+  });
+
+  it('the reranker gets only the chunk text', async () => {
+    const seen: string[][] = [];
+    const reranker = {
+      kind: 'rerank' as const,
+      name: 'spy',
+      model: 'spy',
+      '~types': { providerOptions: {} },
+      rerank: async (o: { documents: string[] }) => {
+        seen.push(o.documents);
+        return {
+          id: 'r',
+          ranking: o.documents.map((_, index) => ({ index, score: 1 })),
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+        };
+      },
+    };
+    const rag = createRag({
+      embedding: new BagOfWordsEmbedding(),
+      store: memoryVectorStore(),
+      rerank: { adapter: reranker as never },
+    });
+    await rag.ingest({ id: 'a', title: 'Pricing page', content: DOCS.pricing, format: 'markdown' });
+    await rag.retrieve('plan');
+    expect(seen[0]).toEqual([DOCS.pricing.trim()]);
   });
 });

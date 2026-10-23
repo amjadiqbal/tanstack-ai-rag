@@ -1,0 +1,12 @@
+* text=auto eol=lf
+
+*.png binary
+
+/test            export-ignore
+/docs            export-ignore
+/art             export-ignore
+/scripts         export-ignore
+/.github         export-ignore
+.editorconfig    export-ignore
+.gitattributes   export-ignore
+.gitignore       export-ignore

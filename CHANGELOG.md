@@ -5,9 +5,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-## [0.1.2] - 2026-10-23
+## [0.1.3] - 2026-10-23
 
-The code is the same as 0.1.0. (v0.1.1 was tagged with these changes but not published; its changelog wrongly said 0.1.0 was unpublished.)
+Corrects the release history. The 0.1.1 changelog wrongly said 0.1.0 was not published, and the v0.1.2 git tag (never published to npm) wrongly said 0.1.1 was not published. Both 0.1.0 and 0.1.1 are on npm. No code changes.
+
+## [0.1.1] - 2026-10-23
+
+No code changes since 0.1.0.
 
 ### Documentation
 

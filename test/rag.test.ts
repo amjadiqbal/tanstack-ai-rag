@@ -1,5 +1,6 @@
+import { BaseRerankAdapter, type RerankAdapterResult, type RerankOptions } from '@tanstack/ai';
 import { describe, expect, it } from 'vitest';
-import { citationInstructions, createRag, memoryVectorStore } from '../src';
+import { citationInstructions, createRag, memoryVectorStore, type RagToolOutput } from '../src';
 import { BagOfWordsEmbedding, DOCS } from './helpers';
 
 const docs = [
@@ -188,3 +189,66 @@ describe('rag.tool()', () => {
     expect(embedding.calls).toEqual([]);
   });
 });
+
+class ReverseRerank extends BaseRerankAdapter<'reverse'> {
+  readonly name = 'reverse';
+  seen: RerankOptions[] = [];
+  constructor() {
+    super({}, 'reverse');
+  }
+  async rerank(options: RerankOptions): Promise<RerankAdapterResult> {
+    this.seen.push(options);
+    const n = options.documents.length;
+    return {
+      id: 'rr',
+      ranking: options.documents.map((_, i) => ({ index: n - 1 - i, score: (n - i) / 10 })).slice(0, options.topN ?? n),
+      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    };
+  }
+}
+
+describe('rerank', () => {
+  it('reranks topK * 4 candidates, keeps topK in the reranker order and reports rerankScore', async () => {
+    const reranker = new ReverseRerank();
+    const { rag } = setup({ topK: 2, rerank: { adapter: reranker } });
+    await rag.ingest(docs);
+    const plain = await createRag({ embedding: new BagOfWordsEmbedding(), store: setupStore(rag), topK: 4 }).retrieve(
+      'refund policy',
+    );
+    const results = await rag.retrieve('refund policy');
+    expect(reranker.seen[0]?.documents).toHaveLength(4);
+    expect(reranker.seen[0]?.topN).toBe(2);
+    expect(results.map((r) => r.id)).toEqual([plain[3]?.id, plain[2]?.id]);
+    expect(results.map((r) => [r.citation, r.rerankScore])).toEqual([
+      [1, 0.4],
+      [2, 0.3],
+    ]);
+  });
+
+  it('applies minScore before reranking and the tool reports rerankScore as score', async () => {
+    const reranker = new ReverseRerank();
+    const { rag } = setup({ topK: 3, minScore: 0.2, rerank: { adapter: reranker, candidates: 10 } });
+    await rag.ingest(docs);
+    const out = (await rag.tool().execute?.({ query: 'refund within 30 days' })) as RagToolOutput;
+    expect(reranker.seen[0]?.documents).toHaveLength(1);
+    expect(out.results).toEqual([expect.objectContaining({ citation: 1, source: 'docs/refunds.md', score: 0.1 })]);
+  });
+
+  it('passes the tool call abort signal to the reranker', async () => {
+    const reranker = new ReverseRerank();
+    const { rag } = setup({ rerank: { adapter: reranker } });
+    await rag.ingest(docs);
+    const controller = new AbortController();
+    await rag.tool().execute?.({ query: 'refund' }, { abortSignal: controller.signal } as never);
+    expect(reranker.seen[0]?.abortSignal).toBe(controller.signal);
+  });
+
+  it('skips the reranker when nothing matched', async () => {
+    const reranker = new ReverseRerank();
+    const { rag } = setup({ rerank: { adapter: reranker } });
+    expect(await rag.retrieve('anything')).toEqual([]);
+    expect(reranker.seen).toEqual([]);
+  });
+});
+
+const setupStore = (rag: ReturnType<typeof createRag>) => rag.store;

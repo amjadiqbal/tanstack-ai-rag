@@ -47,6 +47,11 @@ beforeAll(async () => {
     },
   });
   mock.addFixture({ match: { userMessage: /refund/i, hasToolResult: true }, response: answerFromToolResult });
+  // Only answers when the retrieved context reached the system prompt.
+  mock.addFixture({
+    match: { userMessage: /pricing question/, systemMessage: ['[1] Pricing (Pricing)', '49 dollars'] },
+    response: { content: 'The team plan is 49 dollars a month [1].' },
+  });
   mock.onRerank(/refund/, [
     { index: 2, relevance_score: 0.97 },
     { index: 0, relevance_score: 0.41 },
@@ -136,6 +141,32 @@ describe.each(stores)('%s with @tanstack/ai-openai embeddings', (_label, makeSto
     expect(text).toBe(
       'From Refund policy: Refunds are available within 30 days of purchase. Email billing to request a refund. [1]',
     );
+  });
+});
+
+describe('retrieve first, then chat with the context in the system prompt', () => {
+  it('sends formatContext() output to the model', async () => {
+    const db = new PGlite({ extensions: { vector } });
+    const store = pgvectorStore({ db, dimensions: 256 });
+    await store.migrate();
+    const rag = createRag({ embedding: embeddingAdapter(), store, topK: 1 });
+    await rag.ingest(docs);
+    const question = 'A pricing question: what does the team plan cost per month?';
+    const results = await rag.retrieve(question);
+    const chunks = await collect(
+      chat({
+        threadId: 't3',
+        adapter: createOpenaiChat('gpt-4o-mini', key, { baseURL: `${mockUrl}/v1` }),
+        systemPrompts: [citationInstructions, rag.formatContext(results)],
+        messages: [{ role: 'user', content: question }],
+      }),
+    );
+    const text = chunks
+      .filter((c) => c.type === 'TEXT_MESSAGE_CONTENT')
+      .map((c) => (c as { delta: string }).delta)
+      .join('');
+    expect(text).toBe('The team plan is 49 dollars a month [1].');
+    await db.close();
   });
 });
 

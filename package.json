@@ -1,0 +1,77 @@
+{
+  "name": "@amjadiqbal/tanstack-ai-rag",
+  "version": "0.0.0",
+  "description": "RAG kit for TanStack AI: token-aware markdown and text chunking, embed-and-store with any TanStack AI embedding adapter, pgvector and in-memory vector stores, a retrieval tool for chat() with citations, and optional rerank().",
+  "keywords": [
+    "tanstack",
+    "tanstack-ai",
+    "rag",
+    "retrieval-augmented-generation",
+    "vector-search",
+    "pgvector",
+    "embeddings",
+    "chunking",
+    "semantic-search",
+    "citations",
+    "rerank",
+    "llm"
+  ],
+  "homepage": "https://github.com/amjadiqbal/tanstack-ai-rag#readme",
+  "bugs": "https://github.com/amjadiqbal/tanstack-ai-rag/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amjadiqbal/tanstack-ai-rag.git"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "Amjad Iqbal",
+    "url": "https://amjad.com.pk"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@tanstack/ai": "^1.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.2",
+    "@copilotkit/aimock": "1.46.0",
+    "@electric-sql/pglite": "0.5.11",
+    "@electric-sql/pglite-pgvector": "^0.0.12",
+    "@tanstack/ai": "1.0.0",
+    "@tanstack/ai-cohere": "1.0.0",
+    "@tanstack/ai-openai": "1.0.0",
+    "@types/node": "^22.10.0",
+    "@types/pg": "8.23.1",
+    "drizzle-orm": "0.45.4",
+    "js-tiktoken": "1.0.21",
+    "pg": "8.23.1",
+    "postgres": "3.4.9",
+    "publint": "0.3.25",
+    "tsdown": "0.23.1",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}

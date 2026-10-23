@@ -7,7 +7,7 @@
 
 # TanStack AI RAG: retrieval-augmented generation with pgvector and citations
 
-A small RAG kit for [TanStack AI](https://tanstack.com/ai). TanStack AI gives you `embed()` and `rerank()` and leaves vector search to your app; this package fills that gap: token-aware **Markdown and text chunking**, an **embed-and-store pipeline** that runs on TanStack AI's `embed()`, **pgvector (Postgres)** and **in-memory** vector stores, a **retrieval tool for `chat()`** whose results are numbered so answers can cite `[1]`, `[2]`, and an optional **`rerank()`** step.
+A small RAG kit for [TanStack AI](https://tanstack.com/ai), built on its public APIs: [`embed()`](https://tanstack.com/ai/latest/docs/embeddings), [`rerank()`](https://tanstack.com/ai/latest/docs/rerank/rerank) and [server tools](https://tanstack.com/ai/latest/docs/tools/server-tools). TanStack AI keeps vector storage in your app; this package adds the pieces around it: token-aware **Markdown and text chunking**, an **embed-and-store pipeline** that runs on TanStack AI's `embed()`, **pgvector (Postgres)** and **in-memory** vector stores, a **retrieval tool for `chat()`** whose results are numbered so answers can cite `[1]`, `[2]`, and an optional **`rerank()`** step.
 
 Tested with `@tanstack/ai` 1.0.0, `@tanstack/ai-openai` (embeddings and chat), `@tanstack/ai-cohere` (rerank), and pgvector through `pg`, postgres.js, Drizzle (node-postgres) and PGlite. See [What is tested](#what-is-tested).
 
@@ -40,7 +40,7 @@ const stream = chat({
 - **Ingest**: chunks every document, embeds the chunks in batches with a TanStack AI embedding adapter through `embed()`, and stores them. Ingesting the same document id again replaces its chunks.
 - **Retrieve**: embeds the question, runs a cosine search with an optional metadata filter and minimum score, optionally reranks, and numbers the results for citation.
 - **Tool**: `rag.tool()` is a TanStack AI server tool. The model calls it with a search query; it returns `{ query, results: [{ citation, source, url?, headings?, content, score }] }`, which your UI also receives as the tool call's output, so you can show the sources.
-- No runtime dependencies besides the `@tanstack/ai` peer; the Postgres client is yours. No network calls of its own, no telemetry.
+- No runtime dependencies besides the `@tanstack/ai` peer, and it imports only `embed`, `rerank` and `toolDefinition` from its main entry (no internal subpaths). The Postgres client is yours. No network calls of its own, no telemetry.
 
 ## Install
 
@@ -243,6 +243,30 @@ const rag = createRag({
 
 The results come back in the reranker's order, each with `rerankScore`; the tool reports `rerankScore` as `score` when a reranker is set. `minScore` still applies to the vector score, before reranking. Inside `chat()`, the tool call's abort signal is passed to the rerank request.
 
+## Errors and edge cases
+
+| Situation | What happens |
+|---|---|
+| `maxTokens` not a positive integer, or `overlap` not an integer from 0 to `maxTokens - 1` | `RangeError` from `chunkText` / `chunkMarkdown` / `ingest()` |
+| `overlap` not set | `min(64, floor(maxTokens / 4))` |
+| A document without `id`, or two documents with the same `id` in one `ingest()` call | `TypeError` (`every document needs an id`, `duplicate document id "<id>"`), nothing stored |
+| `ingest([])` | Returns `{ documents: 0, chunks: 0 }` without calling the embedding adapter |
+| A document whose content is empty or only whitespace | No chunks; its previous chunks are deleted (`chunks: 0`) |
+| The embedding adapter returns a different number of vectors than inputs | `Error: embedding adapter returned <n> vectors for <m> inputs`, old chunks kept |
+| Any error from the embedding adapter during `ingest()` | Rethrown, old chunks kept |
+| `batchSize` below 1 | Treated as 1 |
+| `metadata` with keys `title`, `url`, `headings` or `chunkIndex` | Overwritten by the document's `title`/`url` and the chunk's own values |
+| `topK: 0` | `[]` |
+| Reranker configured but no vector match | `[]`, the reranker is not called |
+| Tool called with an empty, blank or missing `query` | `{ query: '', results: [] }`, nothing embedded |
+| Tool `score` | Rounded to 3 decimals (the rerank score when a reranker is set) |
+| `memoryVectorStore`: vectors of different lengths | `RangeError: vector length mismatch: <a> vs <b>` on query; a zero vector scores 0 |
+| `pgvectorStore`: a table name that isn't `name` or `schema.name` (letters, digits, `_`) | `TypeError` when the store is created |
+| `pgvectorStore`: `db` is none of the supported clients | `TypeError` when the store is created |
+| `pgvectorStore.migrate()` without `dimensions` | `TypeError`, nothing created |
+| `pgvectorStore`: `NaN` or `Infinity` in a vector | `TypeError` before any SQL runs |
+| `pgvectorStore`: a vector of the wrong size | Postgres's own error (`expected 3 dimensions, not 2`) |
+
 ## Scores and `minScore`
 
 `score` is cosine similarity. What counts as a good score depends on the embedding model (scores from some models sit in a narrow band), so pick `minScore` by looking at your own results. Without `minScore`, `retrieve()` returns `topK` results whenever the store has that many, even weak ones; `citationInstructions` tells the model to say when the results don't answer the question.
@@ -278,7 +302,7 @@ const chunks = chunkMarkdown(markdown, { maxTokens: 400, overlap: 40, countToken
 
 No live provider API was called and no API key was used. Provider traffic went to local mocks: [aimock](https://github.com/CopilotKit/aimock) for OpenAI chat and Cohere rerank, and a small local server for OpenAI's `/v1/embeddings` that returns bag-of-words vectors per input, so similarity is meaningful.
 
-- **Unit tests** (vitest): chunk sizes with the estimator and with `js-tiktoken`, overlap, offsets, coverage, paragraph-first breaking, hard splits, Markdown heading paths, fenced code (backticks and tildes, `#` lines inside fences), CRLF; `createRag` ingest, re-ingest, failed-embedding rollback, remove, filters, `minScore`, batching, model options, `formatContext`, rerank order, scores and abort signal, and the tool's output, name, description, filter and empty query.
+- **Unit tests** (vitest): chunk sizes with the estimator and with `js-tiktoken`, overlap, offsets, coverage, paragraph-first breaking, hard splits, Markdown heading paths, fenced code (backticks and tildes, `#` lines inside fences), CRLF; `createRag` ingest, re-ingest, failed-embedding rollback, remove, filters, `minScore`, batching, model options, `formatContext`, rerank order, scores and abort signal, the tool's output, name, description, filter and empty query, and every row of [Errors and edge cases](#errors-and-edge-cases).
 - **Store conformance** (the same checks for each): `memoryVectorStore`, and `pgvectorStore` on PGlite and on Postgres 17 + pgvector in Docker (`pgvector/pgvector:pg17`) through `pg`, postgres.js and Drizzle (`drizzle-orm/node-postgres`): nearest-first order, scores, metadata filters, nested JSON metadata, upsert-replace, delete by document, 1,200-row batches, idempotent `migrate()` and the HNSW index.
 - **Integration** with real TanStack AI adapters over HTTP: `@tanstack/ai-openai` embeddings into PGlite and Docker Postgres; `chat()` with `openaiText` (Responses API) and `openaiChatCompletions` calling `rag.tool()` and answering with a citation; retrieved context passed through `systemPrompts`; `@tanstack/ai-cohere` rerank reordering results.
 - **In a real browser**: a TanStack Start 1.169 app with `@tanstack/ai-react` `useChat`, the server route above, Postgres + pgvector in Docker, and the packed npm tarball installed. Seen working: ingesting Markdown documents, search with heading paths and scores, the product filter, the `formatContext` block, a chat question that triggers the tool and shows numbered sources (with a link from `url`) and an answer citing `[1]`, follow-up turns on the same thread, a newly added document found by the next question, a removed document no longer returned, and rerank reordering the sources.

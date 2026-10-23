@@ -5,6 +5,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-23
+
+0.1.0 was tagged but never published to npm; 0.1.1 is the first npm release. The code is the same as 0.1.0.
+
+### Documentation
+
+- README: an "Errors and edge cases" table (every row backed by a test), links to TanStack AI's `embed()`, `rerank()` and server-tools docs, and a note that the package imports only public `@tanstack/ai` APIs.
+
 ## [0.1.0] - 2026-10-23
 
 ### Added
